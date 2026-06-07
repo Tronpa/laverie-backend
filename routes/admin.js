@@ -1,6 +1,6 @@
-const express = require('express');
+﻿const express = require('express');
 const router  = express.Router();
-const bcrypt  = require('bcrypt');
+const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const db      = require('../config/database');
 const { authAdmin } = require('../middleware/auth');
@@ -170,3 +170,4 @@ router.put('/forfaits/:id', authAdmin, async (req, res) => {
 });
 
 module.exports = router;
+

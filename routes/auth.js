@@ -1,6 +1,6 @@
 ﻿const express  = require('express');
 const router   = express.Router();
-const bcrypt   = require('bcrypt');
+const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
 const db       = require('../config/database');
 const { verifierZone } = require('../services/zone');
@@ -213,5 +213,6 @@ async function envoyerOTP(telephone) {
 }
 
 module.exports = router;
+
 
 
