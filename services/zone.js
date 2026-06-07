@@ -1,0 +1,1 @@
+async function verifierZone(adresse) { return { lat: 48.8566, lng: 2.3522, adresse_formatee: adresse, distance: 0, dans_zone: true }; } function distanceKm() { return 0; } module.exports = { verifierZone, distanceKm };
