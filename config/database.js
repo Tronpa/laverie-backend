@@ -1,7 +1,8 @@
-const { Pool } = require('pg');
+﻿const { Pool } = require('pg');
 require('dotenv').config();
 
 const pool = new Pool({
+  ssl: { rejectUnauthorized: false },
   host:     process.env.DB_HOST,
   port:     process.env.DB_PORT,
   database: process.env.DB_NAME,
@@ -11,12 +12,13 @@ const pool = new Pool({
 
 pool.on('connect', () => {
   if (process.env.NODE_ENV !== 'production') {
-    console.log('✅ Connecté à PostgreSQL');
+    console.log('âœ… ConnectÃ© Ã  PostgreSQL');
   }
 });
 
 pool.on('error', (err) => {
-  console.error('❌ Erreur PostgreSQL :', err.message);
+  console.error('âŒ Erreur PostgreSQL :', err.message);
 });
 
 module.exports = pool;
+
