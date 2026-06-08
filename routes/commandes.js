@@ -3,39 +3,30 @@ const router  = express.Router();
 const db      = require('../config/database');
 const { authClient } = require('../middleware/auth');
 const { notifierChangementStatut } = require('../services/notifications');
+const { verifierZone } = require('../services/zone');
 
-// ─── GET /commandes/creneaux : Créneaux disponibles ─────────────────────────
-// Retourne les créneaux libres pour les 7 prochains jours
+// --- GET /commandes/creneaux : creneaux disponibles ---
 router.get('/creneaux', authClient, async (req, res) => {
   try {
     const creneaux = [];
     const now = new Date();
-
     for (let jour = 0; jour < 7; jour++) {
       const date = new Date(now);
       date.setDate(now.getDate() + jour + 1);
-      // Pas de collecte le dimanche (0)
       if (date.getDay() === 0) continue;
-
       const dateStr = date.toISOString().split('T')[0];
-
       for (const heure of ['08:00', '10:00', '14:00', '16:00']) {
-        const debut = new Date(`${dateStr}T${heure}:00`);
+        const debut = new Date(dateStr + 'T' + heure + ':00');
         const fin   = new Date(debut.getTime() + 2 * 60 * 60 * 1000);
-
-        // Vérifier le nombre de commandes déjà prises sur ce créneau (max 5)
         const count = await db.query(
-          `SELECT COUNT(*) FROM commandes
-           WHERE rdv_collecte >= $1 AND rdv_collecte < $2
-           AND statut NOT IN ('annulee')`,
+          `SELECT COUNT(*) FROM commandes WHERE rdv_collecte >= $1 AND rdv_collecte < $2 AND statut NOT IN ('annulee')`,
           [debut, fin]
         );
         const nbPris = parseInt(count.rows[0].count);
-
         creneaux.push({
           debut: debut.toISOString(),
-          fin:   fin.toISOString(),
-          label: `${heure.replace(':00','')}h – ${String(fin.getHours()).padStart(2,'0')}h`,
+          fin: fin.toISOString(),
+          label: heure.replace(':00','') + 'h - ' + String(fin.getHours()).padStart(2,'0') + 'h',
           disponible: nbPris < 5,
           nb_pris: nbPris,
         });
@@ -43,11 +34,12 @@ router.get('/creneaux', authClient, async (req, res) => {
     }
     res.json(creneaux);
   } catch (err) {
+    console.error('Erreur creneaux:', err);
     res.status(500).json({ message: 'Erreur serveur.' });
   }
 });
 
-// ─── GET /commandes : Toutes les commandes du client connecté ───────────────
+// --- GET /commandes : commandes du client connecte ---
 router.get('/', authClient, async (req, res) => {
   try {
     const result = await db.query(
@@ -58,23 +50,32 @@ router.get('/', authClient, async (req, res) => {
        ORDER BY c.created_at DESC`,
       [req.user.id]
     );
-    // Ajouter les articles de chaque commande
-    const commandes = await Promise.all(
-      result.rows.map(async (cmd) => {
-        const articles = await db.query(
-          'SELECT article, quantite FROM commande_articles WHERE commande_id = $1',
-          [cmd.id]
-        );
-        return { ...cmd, articles: articles.rows };
-      })
-    );
-    res.json(commandes);
+    res.json({ commandes: result.rows });
   } catch (err) {
+    console.error('Erreur liste commandes:', err);
     res.status(500).json({ message: 'Erreur serveur.' });
   }
 });
 
-// ─── GET /commandes/:id : Détail d'une commande ─────────────────────────────
+// --- GET /commandes/mes-commandes : alias pratique (site web) ---
+router.get('/mes-commandes', authClient, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT c.*, f.nom AS forfait_nom, f.prix AS forfait_prix
+       FROM commandes c
+       LEFT JOIN forfaits f ON c.forfait_id = f.id
+       WHERE c.user_id = $1
+       ORDER BY c.created_at DESC`,
+      [req.user.id]
+    );
+    res.json({ commandes: result.rows });
+  } catch (err) {
+    console.error('Erreur mes-commandes:', err);
+    res.status(500).json({ message: 'Erreur serveur.' });
+  }
+});
+
+// --- GET /commandes/:id ---
 router.get('/:id', authClient, async (req, res) => {
   try {
     const result = await db.query(
@@ -86,29 +87,42 @@ router.get('/:id', authClient, async (req, res) => {
       [req.params.id, req.user.id]
     );
     if (!result.rows.length) return res.status(404).json({ message: 'Commande introuvable.' });
-
-    const articles = await db.query(
-      'SELECT article, quantite FROM commande_articles WHERE commande_id = $1',
-      [req.params.id]
-    );
-    res.json({ ...result.rows[0], articles: articles.rows });
+    res.json(result.rows[0]);
   } catch (err) {
+    console.error('Erreur detail commande:', err);
     res.status(500).json({ message: 'Erreur serveur.' });
   }
 });
 
-// ─── POST /commandes : Créer une nouvelle commande ──────────────────────────
+// --- POST /commandes : creer une commande (geocode l'adresse + valide la zone) ---
 router.post('/', authClient, async (req, res) => {
   const client = await db.connect();
   try {
-    const { forfait_id, adresse_collecte, lat_collecte, lng_collecte, rdv_collecte, articles, note_client } = req.body;
+    // accepte 'note' (site) ou 'note_client' (app)
+    const forfait_id = req.body.forfait_id;
+    const adresse_collecte = req.body.adresse_collecte;
+    const rdv_collecte = req.body.rdv_collecte;
+    const articles = req.body.articles;
+    const note_client = req.body.note || req.body.note_client || null;
 
     if (!forfait_id || !adresse_collecte || !rdv_collecte) {
-      return res.status(400).json({ message: 'Forfait, adresse et créneau requis.' });
+      return res.status(400).json({ message: 'Forfait, adresse et creneau requis.' });
     }
 
     const forfait = await db.query('SELECT * FROM forfaits WHERE id = $1 AND actif = TRUE', [forfait_id]);
     if (!forfait.rows.length) return res.status(404).json({ message: 'Forfait introuvable.' });
+
+    // Geocodage + verification de zone (10 km)
+    let lat = null, lng = null;
+    try {
+      const zone = await verifierZone(adresse_collecte);
+      lat = zone.lat; lng = zone.lng;
+      if (!zone.dans_zone) {
+        return res.status(400).json({ message: 'Adresse hors zone : nous collectons dans un rayon de 10 km autour de la laverie (distance ' + zone.distance + ' km).' });
+      }
+    } catch (geoErr) {
+      return res.status(400).json({ message: 'Adresse introuvable. Verifiez l adresse saisie.' });
+    }
 
     await client.query('BEGIN');
 
@@ -116,11 +130,10 @@ router.post('/', authClient, async (req, res) => {
       `INSERT INTO commandes (user_id, forfait_id, adresse_collecte, lat_collecte, lng_collecte, rdv_collecte, montant_total, note_client)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
-      [req.user.id, forfait_id, adresse_collecte, lat_collecte, lng_collecte, rdv_collecte, forfait.rows[0].prix, note_client || null]
+      [req.user.id, forfait_id, adresse_collecte, lat, lng, rdv_collecte, forfait.rows[0].prix, note_client]
     );
     const commande = cmd.rows[0];
 
-    // Insérer les articles si fournis
     if (articles && articles.length) {
       for (const art of articles) {
         await client.query(
@@ -132,60 +145,31 @@ router.post('/', authClient, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Notification de confirmation
-    await notifierChangementStatut({ ...commande, statut: 'en_attente', user_id: req.user.id });
+    try { await notifierChangementStatut({ ...commande, statut: 'en_attente', user_id: req.user.id }); } catch(e) {}
 
-    res.status(201).json({ message: 'Commande créée avec succès !', commande });
+    res.status(201).json({ message: 'Commande creee avec succes !', commande });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error(err);
-    res.status(500).json({ message: 'Erreur serveur.' });
+    console.error('Erreur creation commande:', err);
+    res.status(500).json({ message: 'Erreur serveur: ' + err.message });
   } finally {
     client.release();
   }
 });
 
-// ─── PATCH /commandes/:id/annuler : Annuler une commande ────────────────────
+// --- PATCH /commandes/:id/annuler ---
 router.patch('/:id/annuler', authClient, async (req, res) => {
   try {
-    const commande = await db.query(
-      'SELECT * FROM commandes WHERE id = $1 AND user_id = $2',
-      [req.params.id, req.user.id]
-    );
+    const commande = await db.query('SELECT * FROM commandes WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
     if (!commande.rows.length) return res.status(404).json({ message: 'Commande introuvable.' });
     if (!['en_attente', 'confirmee'].includes(commande.rows[0].statut)) {
-      return res.status(400).json({ message: 'Cette commande ne peut plus être annulée.' });
+      return res.status(400).json({ message: 'Cette commande ne peut plus etre annulee.' });
     }
-    await db.query(
-      'UPDATE commandes SET statut = $1, updated_at = NOW() WHERE id = $2',
-      ['annulee', req.params.id]
-    );
-    await notifierChangementStatut({ ...commande.rows[0], statut: 'annulee' });
-    res.json({ message: 'Commande annulée.' });
+    await db.query('UPDATE commandes SET statut = $1, updated_at = NOW() WHERE id = $2', ['annulee', req.params.id]);
+    try { await notifierChangementStatut({ ...commande.rows[0], statut: 'annulee' }); } catch(e) {}
+    res.json({ message: 'Commande annulee.' });
   } catch (err) {
-    res.status(500).json({ message: 'Erreur serveur.' });
-  }
-});
-
-// ─── POST /commandes/:id/avis : Laisser un avis ─────────────────────────────
-router.post('/:id/avis', authClient, async (req, res) => {
-  try {
-    const { note, commentaire } = req.body;
-    if (!note || note < 1 || note > 5) return res.status(400).json({ message: 'Note entre 1 et 5 requise.' });
-
-    const commande = await db.query(
-      'SELECT * FROM commandes WHERE id = $1 AND user_id = $2 AND statut = $3',
-      [req.params.id, req.user.id, 'livree']
-    );
-    if (!commande.rows.length) return res.status(404).json({ message: 'Commande introuvable ou non livrée.' });
-
-    await db.query(
-      'INSERT INTO avis (user_id, commande_id, note, commentaire) VALUES ($1, $2, $3, $4)',
-      [req.user.id, req.params.id, note, commentaire || null]
-    );
-    res.status(201).json({ message: 'Merci pour votre avis !' });
-  } catch (err) {
-    if (err.code === '23505') return res.status(400).json({ message: 'Vous avez déjà laissé un avis pour cette commande.' });
+    console.error('Erreur annulation:', err);
     res.status(500).json({ message: 'Erreur serveur.' });
   }
 });
